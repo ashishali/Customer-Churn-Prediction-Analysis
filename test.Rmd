@@ -1,0 +1,894 @@
+---
+title: "Telecom Customer Churn Prediction Analysis"
+author: "Ashish Yakub Beary"
+date: "2025-04-20"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+    highlight: kate
+    code_folding: show
+---
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 10,
+  fig.height = 10
+)
+```
+
+# 1. Introduction
+
+This report presents an analysis of customer churn for a telecommunications company. Customer churn, or the rate at which customers stop doing business with a company, is a critical metric in the telecom industry due to the high cost of acquiring new customers compared to retaining existing ones.
+
+## 1.1 Research Questions
+
+The primary research question addressed in this analysis is:
+
+* What factors most significantly predict customer churn in the telecom industry?
+
+Secondary questions include:
+
+* How do service usage patterns and demographics correlate with churn probability?
+* Which specific services or contract features have the strongest protective effect against churn?
+* Can we identify high-risk customers early to implement targeted retention strategies?
+
+## 1.2 Dataset Overview
+
+The analysis is based on the following datasets:
+
+* **telecom_customer_churn.csv**: Primary dataset containing customer information (7,043 customers with 38 variables)
+* **telecom_zipcode_population.csv**: Supplementary dataset with population information by zip code
+* **telecom_data_dictionary.csv**: Metadata describing each variable
+
+```{r load-libraries}
+# Load necessary packages
+library(tidyverse)  # For data manipulation and visualization
+library(caret)      # For machine learning workflow
+library(randomForest) # For random forest model
+library(pROC)       # For ROC curve analysis
+library(corrplot)   # For correlation visualization
+library(janitor)    # For cleaning column names
+library(scales)     # For nice scales on plots
+library(knitr)      # For tables
+library(kableExtra) # For enhanced tables
+library(viridis)    # For nice color palettes
+library(gridExtra)  # For combining plots
+library(pdp)        # For partial dependence plots
+library(broom)
+
+# Set seed for reproducibility
+set.seed(123)
+```
+
+# 2. Data Loading and Initial Exploration
+
+```{r load-data}
+# Read the datasets
+telecom_churn <- read.csv("telecom_customer_churn.csv", stringsAsFactors = TRUE)
+zipcode_population <- read.csv("telecom_zipcode_population.csv")
+data_dictionary <- read.csv("telecom_data_dictionary.csv", encoding = "CP1252")
+
+# Clean column names
+telecom_churn <- clean_names(telecom_churn)
+zipcode_population <- clean_names(zipcode_population)
+data_dictionary <- clean_names(data_dictionary)
+```
+
+## 2.1 Data Structure
+
+Let's examine the structure of our main dataset:
+
+```{r data-structure}
+# Display the structure of the first few columns
+str(telecom_churn[,])
+
+# Get a summary of the dataset dimensions
+cat("Number of customers:", nrow(telecom_churn), "\n")
+cat("Number of variables:", ncol(telecom_churn), "\n")
+```
+
+## 2.2 Create Binary Churn Variable
+
+For our analysis, we'll create a binary churn variable that indicates whether a customer has churned or not.
+
+```{r binary-churn}
+# Create binary churn variable for analysis
+telecom_churn$churned <- ifelse(telecom_churn$customer_status == "Churned", "Yes", "No")
+telecom_churn$churned <- as.factor(telecom_churn$churned)
+
+# Check distribution
+table(telecom_churn$churned)
+```
+
+## 2.3 Basic Summary Statistics
+
+```{r summary-stats}
+# Basic summary statistics for key numerical variables
+summary(telecom_churn[c("age", "tenure_in_months", "number_of_dependents",
+                       "avg_monthly_gb_download", "monthly_charge", "total_charges")])
+```
+
+# 3. Data Cleaning and Preprocessing
+
+## 3.1 Missing Values
+
+```{r missing-values}
+# Check for missing values
+missing_values <- colSums(is.na(telecom_churn))
+missing_values[missing_values > 0]
+
+# Handle missing values for avg_monthly_gb_download using median imputation
+telecom_churn$avg_monthly_gb_download[is.na(telecom_churn$avg_monthly_gb_download)] <- 
+  median(telecom_churn$avg_monthly_gb_download, na.rm = TRUE)
+
+telecom_churn$avg_monthly_long_distance_charges[is.na(telecom_churn$avg_monthly_long_distance_charges)] <- 
+  median(telecom_churn$avg_monthly_long_distance_charges, na.rm = TRUE)
+```
+
+## 3.2 Handling Categorical Variables
+
+Some categorical variables have empty values because they are conditionally relevant. For example, internet-related services are only applicable to customers with internet service. 
+
+```{r handle-categorical}
+# Convert empty strings to NA for certain categorical columns
+service_cols <- c("multiple_lines", "internet_type", "online_security", 
+                 "online_backup", "device_protection_plan", "premium_tech_support",
+                 "streaming_tv", "streaming_movies", "streaming_music", "unlimited_data")
+
+for(col in service_cols) {
+  telecom_churn[[col]] <- as.character(telecom_churn[[col]])
+  telecom_churn[[col]][telecom_churn[[col]] == ""] <- NA
+  telecom_churn[[col]] <- as.factor(telecom_churn[[col]])
+}
+
+# Some customers don't have internet service, which is why they have NA for internet-related services
+# We'll recode these NAs as "No Internet Service"
+internet_related <- c("internet_type", "online_security", "online_backup", 
+                      "device_protection_plan", "premium_tech_support",
+                      "streaming_tv", "streaming_movies", "streaming_music", 
+                      "unlimited_data")
+
+for(col in internet_related) {
+  levels(telecom_churn[[col]]) <- c(levels(telecom_churn[[col]]), "No Internet Service")
+  telecom_churn[[col]][is.na(telecom_churn[[col]]) & telecom_churn$internet_service == "No"] <- "No Internet Service"
+}
+
+# Similarly for phone-related services
+phone_related <- c("multiple_lines")
+for(col in phone_related) {
+  levels(telecom_churn[[col]]) <- c(levels(telecom_churn[[col]]), "No Phone Service")
+  telecom_churn[[col]][is.na(telecom_churn[[col]]) & telecom_churn$phone_service == "No"] <- "No Phone Service"
+}
+
+```
+
+# 4. Exploratory Data Analysis
+
+## 4.1 Overall Churn Rate
+
+```{r churn-rate}
+# Calculate overall churn rate
+churn_rate <- mean(telecom_churn$customer_status == "Churned") * 100
+cat("Overall churn rate:", round(churn_rate, 2), "%\n")
+
+# Visualize the churn distribution
+ggplot(telecom_churn, aes(x = customer_status)) +
+  geom_bar(fill = c("#52664b", "#2e6083", "#2e6083")) +
+  geom_text(stat = "count", aes(label = scales::percent(after_stat(count)/sum(after_stat(count)))),
+            vjust = -0.5) +
+  labs(title = paste0("Customer Status Distribution (Churn Rate: ", round(churn_rate, 1), "%)"),
+       x = "Customer Status",
+       y = "Count") +
+  theme_minimal()
+```
+
+## 4.2 Numeric Variables and Churn
+
+Let's examine the relationship between key numerical variables and churn:
+
+```{r numeric-vars}
+# Age distribution by churn status
+p1 <- ggplot(telecom_churn, aes(x = churned, y = age, fill = churned)) +
+  geom_boxplot() +
+  labs(title = "Age Distribution by Churn Status",
+       x = "Churned",
+       y = "Age") +
+  scale_fill_manual(values = c("#2e6083", "#52664b")) +
+  theme_minimal()
+
+# Tenure distribution by churn status
+p2 <- ggplot(telecom_churn, aes(x = churned, y = tenure_in_months, fill = churned)) +
+  geom_boxplot() +
+  labs(title = "Customer Tenure by Churn Status",
+       x = "Churned",
+       y = "Tenure (months)") +
+  scale_fill_manual(values = c("#2e6083", "#52664b")) +
+  theme_minimal()
+
+# Monthly charge distribution by churn status
+p3 <- ggplot(telecom_churn, aes(x = churned, y = monthly_charge, fill = churned)) +
+  geom_boxplot() +
+  labs(title = "Monthly Charge by Churn Status",
+       x = "Churned",
+       y = "Monthly Charge ($)") +
+  scale_fill_manual(values = c("#2e6083", "#52664b")) +
+  theme_minimal()
+
+# Display plots side by side
+grid.arrange(p1, p2, p3, ncol = 3)
+```
+
+```{r numeric-summary}
+# Calculate mean statistics by churn status
+telecom_churn %>%
+  group_by(churned) %>%
+  summarize(
+    avg_age = mean(age, na.rm = TRUE),
+    avg_tenure = mean(tenure_in_months, na.rm = TRUE),
+    avg_monthly_charge = mean(monthly_charge, na.rm = TRUE),
+    avg_total_charges = mean(total_charges, na.rm = TRUE),
+    avg_monthly_download = mean(avg_monthly_gb_download, na.rm = TRUE)
+  ) %>%
+  kable(caption = "Key Metrics by Churn Status", digits = 2) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+**Observations:**
+
+1. **Age**: Churned customers tend to be slightly older on average.
+2. **Tenure**: There's a substantial difference in tenure between churned and retained customers. Customers who churn have much shorter tenure on average.
+3. **Monthly Charge**: Churned customers have higher monthly charges on average.
+
+## 4.3 Categorical Variables and Churn
+
+Let's analyze how categorical variables relate to churn:
+
+```{r categorical-vars}
+# Create a function to plot churn rate by category
+plot_churn_by_category <- function(data, variable) {
+  # Calculate percentages
+  churn_by_cat <- data %>%
+    group_by(!!sym(variable)) %>%
+    summarize(
+      total = n(),
+      churned = sum(customer_status == "Churned"),
+      churn_rate = churned / total * 100
+    ) %>%
+    arrange(desc(churn_rate))
+  
+  # Create plot
+  ggplot(churn_by_cat, aes(x = reorder(!!sym(variable), -churn_rate), y = churn_rate)) +
+    geom_bar(stat = "identity", fill = "steelblue") +
+    geom_text(aes(label = paste0(round(churn_rate, 1), "%")), vjust = -0.5) +
+    labs(title = paste("Churn Rate by", variable),
+         x = variable,
+         y = "Churn Rate (%)") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+
+# Plot for contract type
+plot_churn_by_category(telecom_churn, "contract")
+```
+
+```{r internet-type}
+# Plot for internet type
+plot_churn_by_category(telecom_churn, "internet_type")
+```
+
+```{r payment-method}
+# Plot for payment method
+plot_churn_by_category(telecom_churn, "payment_method")
+```
+
+**Observations:**
+
+1. **Contract Type**: Month-to-month contracts have a significantly higher churn rate (45.8%) compared to one-year (10.7%) and two-year contracts (2.5%).
+2. **Internet Type**: Fiber optic internet customers have the highest churn rate, while DSL customers and customers opting out of internet service have a lower churn rate.
+3. **Payment Method**: Customers using electronic checks as their payment method have a higher churn rate compared to other payment methods.
+
+## 4.4 Service Adoption Impact on Churn
+
+Let's analyze how various services impact churn:
+
+```{r service-impact}
+# Create a function to calculate service impact on churn
+service_impact <- function(data, service_var) {
+  # Calculate churn rates
+  service_churn <- data %>%
+    group_by(!!sym(service_var)) %>%
+    summarize(
+      total = n(),
+      churned = sum(customer_status == "Churned"),
+      churn_rate = churned / total * 100
+    )
+  
+  return(service_churn)
+}
+
+# Example for online security
+online_security_impact <- service_impact(telecom_churn, "online_security")
+kable(online_security_impact, caption = "Churn Rate by Online Security Status") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+Let's analyze multiple services together:
+
+```{r multiple-services}
+# Selected services to analyze
+selected_services <- c("online_security", "premium_tech_support", "contract")
+
+# Create an empty data frame with the right structure
+services_plot_data <- data.frame(
+  service = character(),
+  service_value = character(),
+  total = numeric(),
+  churned = numeric(),
+  churn_rate = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Loop through each service
+for (service_name in selected_services) {
+  # Get the churn data for this service
+  service_data <- service_impact(telecom_churn, service_name)
+  
+  # Extract the service value column (which has a dynamic name)
+  service_values <- service_data[[1]] # The first column contains the service values
+  
+  # Create a new data frame with consistent column names
+  temp_df <- data.frame(
+    service = service_name,
+    service_value = as.character(service_values),
+    total = service_data$total,
+    churned = service_data$churned,
+    churn_rate = service_data$churn_rate,
+    stringsAsFactors = FALSE
+  )
+  
+  # Add to the main data frame
+  services_plot_data <- rbind(services_plot_data, temp_df)
+}
+
+# Plot with the data
+ggplot(services_plot_data, aes(x = reorder(paste(service, service_value), -churn_rate), y = churn_rate)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  geom_text(aes(label = paste0(round(churn_rate, 1), "%")), vjust = -0.5) +
+  labs(title = "Churn Rate by Selected Services",
+       x = "Service and Status",
+       y = "Churn Rate (%)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+**Observations:**
+
+1. Customers without online security have a much higher churn rate (41.8%) than those with online security (14.6%).
+2. Similar patterns are observed for premium tech support.
+3. This suggests that additional services may create "stickiness" and reduce churn.
+
+## 4.5 Correlation Analysis
+
+Let's examine the correlations between numerical variables:
+
+```{r correlation}
+# Select numerical columns for correlation analysis
+numeric_cols <- telecom_churn %>%
+  select(age, tenure_in_months, number_of_dependents, avg_monthly_long_distance_charges,
+         avg_monthly_gb_download, monthly_charge, total_charges, total_refunds,
+         total_extra_data_charges, total_long_distance_charges, total_revenue) %>%
+  names()
+
+# Calculate correlation matrix
+correlation_matrix <- cor(telecom_churn[numeric_cols], use = "pairwise.complete.obs")
+
+# Create a correlation plot
+corrplot(correlation_matrix, method = "circle", type = "upper", 
+         tl.col = "black", tl.srt = 45, tl.cex = 0.7,
+         title = "Correlation Matrix of Numerical Variables",
+         mar = c(0, 0, 1, 0))
+```
+
+**Key Correlations:**
+
+1. Tenure is positively correlated with total charges, as expected.
+2. Monthly charge is positively correlated with average monthly GB download.
+3. Total revenue is strongly correlated with total charges, monthly charge, and tenure. Moderately with long distance charges.
+
+# 5. Feature Engineering
+
+## 5.1 Create Derived Features
+
+Let's create some additional features that might help improve our predictive models:
+
+```{r feature-engineering}
+# Customer lifetime value (CLV)
+telecom_churn$customer_lifetime_value <- telecom_churn$total_revenue / telecom_churn$tenure_in_months
+
+# Average monthly revenue
+telecom_churn$avg_monthly_revenue <- telecom_churn$total_revenue / telecom_churn$tenure_in_months
+
+# Service count (number of additional services subscribed)
+telecom_churn$service_count <- rowSums(telecom_churn[, c("online_security", 
+                                                       "online_backup", 
+                                                       "device_protection_plan", 
+                                                       "premium_tech_support",
+                                                       "streaming_tv", 
+                                                       "streaming_movies", 
+                                                       "streaming_music")] == "Yes", na.rm = TRUE)
+
+# Visualize service count distribution by churn status
+ggplot(telecom_churn, aes(x = service_count, fill = churned)) +
+  geom_histogram(position = "dodge", binwidth = 1) +
+  labs(title = "Service Count Distribution by Churn Status",
+       x = "Number of Services",
+       y = "Count") +
+  scale_fill_manual(values = c( "#2e6083", "#52664b")) +
+  theme_minimal()
+```
+
+## 5.2 Add Population Data
+
+Let's join the zipcode population data to potentially identify demographic patterns:
+
+```{r join-population}
+# Join zipcode population data
+telecom_churn <- left_join(telecom_churn, zipcode_population, by = "zip_code")
+
+# Calculate population density quartiles
+telecom_churn$population_quartile <- ntile(telecom_churn$population, 4)
+
+# Analyze churn by population quartile
+telecom_churn %>%
+  group_by(population_quartile) %>%
+  summarize(
+    churn_rate = mean(churned == "Yes") * 100,
+    customer_count = n()
+  ) %>%
+  kable(caption = "Churn Rate by Population Quartile", digits = 2) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+# 6. Modeling Preparation
+
+## 6.1 Encoding Categorical Variables
+
+For our models, we need to encode categorical variables:
+
+```{r encoding}
+# For variables with more than two levels, create dummy variables
+dummy_vars <- c("contract", "internet_type", "payment_method", "offer")
+
+# Create a formula for model matrix
+dummy_formula <- as.formula(paste("~", paste(dummy_vars, collapse = " + ")))
+
+# Generate dummy variables
+dummy_data <- model.matrix(dummy_formula, data = telecom_churn)[, -1] # Remove intercept
+
+# Check the actual column names in the dummy data
+colnames(dummy_data)[1:10]  # Look at the first 10 column names to understand the naming pattern
+
+# Combine with original data
+telecom_churn_encoded <- cbind(telecom_churn, as.data.frame(dummy_data))
+
+# Use the correct column names when checking the data
+# For example, if the proper names are:
+head(telecom_churn_encoded[, grep("contract", colnames(telecom_churn_encoded), value = TRUE)])
+```
+
+## 6.2 Feature Selection
+
+Let's select relevant features for our models:
+
+```{r feature-selection}
+# Exclude redundant or irrelevant columns
+exclude_cols <- c("customer_id", "customer_status", "churn_category", "churn_reason", 
+                 "latitude", "longitude", "zip_code", "city")
+
+# Create a new data frame with selected features
+model_data <- telecom_churn_encoded %>%
+  select(-one_of(exclude_cols))
+
+# Check class balance
+table(model_data$churned)
+```
+
+## 6.3 Data Splitting
+
+Let's split our data into training and testing sets:
+
+```{r data-splitting}
+# Split the data into training and testing sets (70/30)
+train_index <- createDataPartition(model_data$churned, p = 0.7, list = FALSE)
+train_data <- model_data[train_index, ]
+test_data <- model_data[-train_index, ]
+
+# Check dimensions
+cat("Training set dimensions:", dim(train_data), "\n")
+cat("Testing set dimensions:", dim(test_data), "\n")
+
+# Check class balance in training set
+table(train_data$churned)
+```
+
+# 7. Logistic Regression Model
+
+## 7.1 Model Building
+
+Let's build a logistic regression model using key variables from our EDA:
+
+```{r logistic-regression}
+# Select key variables for the first model based on our EDA
+logistic_vars <- c("tenure_in_months", "contract", "monthly_charge", 
+                  "internet_type", "online_security", "premium_tech_support",
+                  "payment_method", "paperless_billing", "service_count",
+                  "customer_lifetime_value")
+
+# Create formula for logistic regression
+logistic_formula <- as.formula(paste("churned ~", paste(logistic_vars, collapse = " + ")))
+
+# Fit logistic regression model
+logistic_model <- glm(logistic_formula, family = binomial(link = "logit"), data = train_data)
+
+# Model summary
+summary(logistic_model)
+```
+
+## 7.2 Odds Ratios
+
+Let's examine the odds ratios to interpret the model coefficients:
+
+```{r odds-ratios}
+# Calculate odds ratios
+odds_ratios <- exp(coef(logistic_model))
+odds_ratios_df <- data.frame(
+  Variable = names(odds_ratios),
+  OddsRatio = odds_ratios,
+  LowerCI = exp(confint(logistic_model))[, 1],
+  UpperCI = exp(confint(logistic_model))[, 2]
+)
+
+# Display odds ratios
+odds_ratios_df %>%
+  kable(caption = "Odds Ratios for Logistic Regression Model", digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+**Interpretation:**
+
+- **Tenure**: For each additional month of tenure, the odds of churning decrease by approximately 2.6%.
+- **Contract**: Compared to month-to-month contracts, one-year contracts reduce churn odds by approximately 70%, while two-year contracts reduce churn odds by approximately 90%.
+- **Monthly Charge**: Higher monthly charges slightly increase churn odds (~1.1% per dollar).
+- **Services**:  Customers with online security or premium tech support are significantly less likely to churn, suggesting these services enhance customer retention.
+ - Online Security (Yes): OR = 0.543 → ~46% reduction in churn odds
+ - Premium Tech Support (Yes): OR = 0.584 → ~42% reduction
+
+## 7.3 Model Evaluation
+
+Let's evaluate the logistic regression model on the test data:
+
+```{r logistic-evaluation}
+# Predict on test data
+test_predictions_prob <- predict(logistic_model, newdata = test_data, type = "response")
+test_predictions <- ifelse(test_predictions_prob > 0.5, "Yes", "No")
+
+# Create confusion matrix
+conf_matrix <- confusionMatrix(as.factor(test_predictions), test_data$churned, positive = "Yes")
+print(conf_matrix)
+
+# ROC curve
+roc_obj <- roc(test_data$churned, test_predictions_prob)
+auc_value <- auc(roc_obj)
+
+# Plot ROC curve##
+
+ggroc(roc_obj) +
+  geom_abline(intercept = 1, slope = 1, linetype = "dashed", color = "gray") +
+  labs(title = paste("ROC Curve - Logistic Regression (AUC =", round(auc_value, 3), ")"),
+       x = "False Positive Rate", 
+       y = "True Positive Rate") +
+  theme_minimal()
+```
+
+# 8. Random Forest Model
+
+## 8.1 Model Building
+
+Now let's build a random forest model:
+
+```{r random-forest}
+# Prepare data for random forest (handle factors appropriately)
+rf_data_train <- train_data
+rf_data_test <- test_data
+
+# Make sure the response is a factor
+rf_data_train$churned <- as.factor(rf_data_train$churned)
+rf_data_test$churned <- as.factor(rf_data_test$churned)
+
+# Train random forest model
+set.seed(123)
+rf_model <- randomForest(
+  churned ~ tenure_in_months + contract + monthly_charge + internet_type + 
+    online_security + premium_tech_support + payment_method + 
+    paperless_billing + service_count + avg_monthly_gb_download + 
+    age + number_of_dependents,
+  data = rf_data_train,
+  ntree = 300,
+  mtry = 5,
+  importance = TRUE
+)
+
+# Model summary
+print(rf_model)
+```
+
+## 8.2 Variable Importance
+
+Let's examine which variables are most important in the random forest model:
+
+```{r rf-importance}
+# Variable importance
+var_importance <- importance(rf_model)
+var_importance_df <- data.frame(
+  Variable = rownames(var_importance),
+  MeanDecreaseGini = var_importance[, "MeanDecreaseGini"]
+)
+var_importance_df <- var_importance_df[order(var_importance_df$MeanDecreaseGini, decreasing = TRUE), ]
+
+# Display top 10 variables
+var_importance_df[1:10, ] %>%
+  kable(caption = "Top 10 Most Important Variables in Random Forest Model", digits = 2) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+
+# Plot variable importance
+ggplot(var_importance_df[1:15, ], aes(x = reorder(Variable, MeanDecreaseGini), y = MeanDecreaseGini)) +
+  geom_bar(stat = "identity", fill = "#52664b") +
+  coord_flip() +
+  labs(title = "Random Forest - Variable Importance",
+       x = "Variable",
+       y = "Mean Decrease in Gini") +
+  theme_minimal()
+```
+
+## 8.3 Model Evaluation
+
+Let's evaluate the random forest model on the test data:
+
+```{r rf-evaluation}
+# Predict on test data
+rf_predictions <- predict(rf_model, rf_data_test, type = "class")
+rf_predictions_prob <- predict(rf_model, rf_data_test, type = "prob")[, "Yes"]
+
+# Create confusion matrix
+rf_conf_matrix <- confusionMatrix(rf_predictions, rf_data_test$churned, positive = "Yes")
+print(rf_conf_matrix)
+
+# ROC curve for Random Forest
+rf_roc_obj <- roc(rf_data_test$churned, rf_predictions_prob)
+rf_auc_value <- auc(rf_roc_obj)
+
+# Plot ROC curve for Random Forest
+ggroc(rf_roc_obj) +
+  geom_abline(intercept = 1, slope = 1, linetype = "dashed", color = "gray") +
+  labs(title = paste("ROC Curve - Random Forest (AUC =", round(rf_auc_value, 3), ")"),
+       x = "False Positive Rate", 
+       y = "True Positive Rate") +
+  theme_minimal()
+```
+
+# 9. Model Comparison
+
+Let's compare the performance of our logistic regression and random forest models:
+
+```{r model-comparison}
+# Compare model performance
+model_comparison <- data.frame(
+  Model = c("Logistic Regression", "Random Forest"),
+  Accuracy = c(conf_matrix$overall["Accuracy"], rf_conf_matrix$overall["Accuracy"]),
+  Sensitivity = c(conf_matrix$byClass["Sensitivity"], rf_conf_matrix$byClass["Sensitivity"]),
+  Specificity = c(conf_matrix$byClass["Specificity"], rf_conf_matrix$byClass["Specificity"]),
+  F1_Score = c(conf_matrix$byClass["F1"], rf_conf_matrix$byClass["F1"]),
+  AUC = c(auc_value, rf_auc_value)
+)
+
+# Display comparison
+model_comparison %>%
+  kable(caption = "Model Performance Comparison", digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+# 10. Feature Effects Analysis
+
+## 10.1 Logistic Regression Effects
+
+Let's visualize the effects of significant predictors in our logistic regression model:
+
+```{r logistic-effects}
+# Extract coefficients
+coef_summary <- summary(logistic_model)$coefficients
+significant_vars <- rownames(coef_summary)[coef_summary[, "Pr(>|z|)"] < 0.05]
+
+# Format odds ratios for significant variables
+sig_odds_ratios <- odds_ratios_df[odds_ratios_df$Variable %in% significant_vars, ]
+sig_odds_ratios <- sig_odds_ratios[order(sig_odds_ratios$OddsRatio), ]
+
+# Plot odds ratios for significant variables (excluding intercept)
+ggplot(sig_odds_ratios[sig_odds_ratios$Variable != "(Intercept)", ], 
+                   aes(x = reorder(Variable, OddsRatio), y = OddsRatio)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = LowerCI, ymax = UpperCI), width = 0.2) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "red") +
+  coord_flip() +
+  labs(title = "Odds Ratios for Significant Predictors",
+       x = "Variable",
+       y = "Odds Ratio (log scale)") +
+  scale_y_log10() +
+  theme_minimal()
+```
+
+## 10.2 Random Forest Partial Dependence Plots
+
+Let's examine the partial dependence plots for key variables in our random forest model:
+
+```{r partial-dependence, message=FALSE, warning=FALSE}
+# Create partial dependence plot for tenure
+pdp_tenure <- partial(rf_model, pred.var = "tenure_in_months", plot = TRUE, rug = TRUE, 
+                     train = rf_data_train)
+plot(pdp_tenure, main = "Partial Dependence on Tenure")
+
+# Create partial dependence plot for monthly charge
+pdp_charge <- partial(rf_model, pred.var = "monthly_charge", plot = TRUE, rug = TRUE, 
+                     train = rf_data_train)
+plot(pdp_charge, main = "Partial Dependence on Monthly Charge")
+
+# Create partial dependence plot for service count
+pdp_services <- partial(rf_model, pred.var = "service_count", plot = TRUE, rug = TRUE, 
+                       train = rf_data_train)
+plot(pdp_services, main = "Partial Dependence on Service Count")
+```
+
+# 11. Churn Risk Profiling
+
+## 11.1 Predicting Churn Probability
+
+Let's use our random forest model (which had better performance) to predict churn probability for all customers:
+
+```{r churn-probability}
+# Use the random forest model (better performance)
+all_predictions_prob <- predict(rf_model, model_data, type = "prob")[, "Yes"]
+model_data$churn_probability <- all_predictions_prob
+
+# Create risk segments
+model_data$risk_segment <- cut(model_data$churn_probability, 
+                              breaks = c(0, 0.3, 0.6, 1),
+                              labels = c("Low Risk", "Medium Risk", "High Risk"))
+
+# Count customers in each risk segment
+risk_counts <- table(model_data$risk_segment)
+print(risk_counts)
+
+# Visualize risk segments
+ggplot(model_data, aes(x = risk_segment, fill = risk_segment)) +
+  geom_bar() +
+  geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.5) +
+  labs(title = "Customer Distribution by Churn Risk Segment",
+       x = "Risk Segment",
+       y = "Number of Customers") +
+  scale_fill_manual(values = c("#2e6083", "#2e6083", "#52664b")) +
+  theme_minimal()
+```
+
+## 11.2 High Risk Customer Profile
+
+Let's analyze the characteristics of high-risk customers:
+
+```{r high-risk-profile}
+# Analyze high risk customer profiles
+high_risk_profile <- model_data %>%
+  filter(risk_segment == "High Risk") %>%
+  summarize(
+    count = n(),
+    avg_tenure = mean(tenure_in_months),
+    avg_monthly_charge = mean(monthly_charge),
+    pct_month_to_month = mean(contract == "Month-to-Month") * 100,
+    pct_fiber = mean(internet_type == "Fiber Optic") * 100,
+    pct_no_online_security = mean(online_security == "No") * 100,
+    pct_no_tech_support = mean(premium_tech_support == "No") * 100,
+    avg_service_count = mean(service_count)
+  )
+
+# Display high risk profile
+high_risk_profile %>%
+  t() %>% 
+  as.data.frame() %>%
+  rownames_to_column("Metric") %>%
+  setNames(c("Metric", "Value")) %>%
+  kable(caption = "High Risk Customer Profile", digits = 2) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+# 12. Conclusion and Recommendations
+
+## 12.1 Key Findings
+
+Based on our comprehensive analysis, we've identified several key factors that significantly predict customer churn:
+
+1. **Tenure**: Shorter customer tenure is strongly associated with higher churn probability.
+2. **Contract Type**: Month-to-month contracts have a significantly higher churn rate (45.8%) compared to one-year (10.7%) and two-year contracts (2.5%).
+3. **Internet Type**: Fiber optic internet customers have the highest churn rate.
+4. **Service Adoption**: Customers without online security and tech support are more likely to churn.
+5. **Monthly Charges**: Higher monthly charges are associated with increased churn risk.
+
+## 12.2 Model Performance
+
+Our random forest model achieved strong predictive performance:
+
+- Accuracy: `r round(rf_conf_matrix$overall["Accuracy"], 3)`
+- AUC: `r round(rf_auc_value, 3)`
+- Sensitivity (True Positive Rate): `r round(rf_conf_matrix$byClass["Sensitivity"], 3)`
+- Specificity (True Negative Rate): `r round(rf_conf_matrix$byClass["Specificity"], 3)`
+
+## 12.3 Business Recommendations
+
+Based on our findings, we recommend the following retention strategies:
+
+1. **Target Month-to-Month Customers**: Implement targeted campaigns to convert month-to-month customers to longer-term contracts.
+2. **Early Tenure Focus**: Develop specialized retention programs for customers in their first 12 months of service.
+3. **Service Bundle Incentives**: Encourage adoption of online security and tech support services, which are associated with lower churn rates.
+4. **Fiber Optic Customer Support**: Address potential service quality issues for fiber optic internet customers.
+5. **High-Value Customer Retention**: Create specialized retention programs for customers with high monthly charges but low service adoption.
+
+## 12.4 Implementation Plan
+
+1. **Risk Segmentation**: Use the model to score all customers and implement tiered retention strategies.
+2. **Proactive Outreach**: Contact high-risk customers before they churn with personalized offers.
+3. **Service Quality Improvement**: Address potential service issues for high-churn segments.
+4. **Contract Conversion Campaigns**: Offer incentives for month-to-month customers to upgrade to longer contracts.
+5. **Service Bundle Promotions**: Create attractive bundles including the protective services identified in our analysis.
+
+```{r save-high-risk}
+# Save the high risk customer list for targeted interventions
+# First check if customer_id exists in the original dataset
+if ("customer_id" %in% colnames(telecom_churn)) {
+  # Option 1: Join back the customer_id column to the high-risk customers
+  high_risk_customers <- model_data %>%
+    filter(risk_segment == "High Risk") %>%
+    # Create a row number to join with
+    mutate(row_id = row_number()) %>%
+    # Add the customer_id from the original data
+    left_join(
+      telecom_churn %>% 
+        select(customer_id) %>%
+        mutate(row_id = row_number()),
+      by = "row_id"
+    ) %>%
+    # Remove the temporary row_id
+    select(-row_id) %>%
+    # Now select the desired columns
+    select(customer_id, churn_probability, tenure_in_months, monthly_charge, 
+           contract, internet_type, online_security, premium_tech_support)
+} else {
+  # Option 2: If there's no customer_id at all, create a sequential ID
+  high_risk_customers <- model_data %>%
+    filter(risk_segment == "High Risk") %>%
+    # Create a sequential ID
+    mutate(customer_id = paste0("HR_", row_number())) %>%
+    select(customer_id, churn_probability, tenure_in_months, monthly_charge, 
+           contract, internet_type, online_security, premium_tech_support)
+}
+
+# Check the result
+head(high_risk_customers)
+
+# Write the high risk customers to a CSV file
+write.csv(high_risk_customers, "high_risk_customers.csv", row.names = FALSE)
+```
+
+---

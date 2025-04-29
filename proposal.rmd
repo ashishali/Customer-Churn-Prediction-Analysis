@@ -1,0 +1,385 @@
+---
+title: "Telecom Customer Churn Prediction Project Proposal"
+author: "Ashish Yakub Beary"
+date: "`r Sys.Date()`"
+output: 
+  pdf_document: default
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# Load necessary packages
+library(tidyverse)
+library(janitor)
+library(skimr)
+library(knitr)
+library(caret)
+library(corrplot)
+library(randomForest)
+library(pROC)
+```
+
+## Research Question
+
+* What factors most significantly predict customer churn in the telecom industry?
+* Secondary questions:
+  * How do service usage patterns and demographics correlate with churn probability?
+  * Which specific services or contract features have the strongest protective effect against churn?
+  * Can we identify high-risk customers early to implement targeted retention strategies?
+
+## Cases
+
+* Each case represents an individual customer of a telecommunications company
+* The dataset contains 7,043 unique customers
+* Each record includes comprehensive information about customer demographics, service subscriptions, billing information, and churn status
+
+## Method of Data Collection
+
+* The data was collected by the telecommunications company from their customer relationship management (CRM) system and billing databases
+* It represents historical customer data from account creation through either current active status or account termination
+* The information includes service subscriptions, billing details, demographic information, and geographic data
+
+## Type of Study
+
+* This is an observational study as it analyzes existing customer data without experimental manipulation
+* The study examines patterns and relationships in historical data to identify predictive factors for customer churn
+
+## Data Source
+
+* Primary dataset: telecom_customer_churn.csv (7,043 rows × 38 columns)
+* Supplementary datasets: 
+  * telecom_zipcode_population.csv - population data by zip code
+  * telecom_data_dictionary.csv - metadata describing each variable
+
+## Variables
+
+### Response Variable
+
+* **Customer Status** (categorical): Customer's current status, with "Churned" indicating customers who have left the company
+* For binary analysis purposes, this will be transformed into a churn indicator (Yes/No)
+
+### Explanatory Variables
+
+#### Demographics
+* Gender (categorical)
+* Age (numerical)
+* Married (categorical - Yes/No)
+* Number of Dependents (numerical)
+* City (categorical)
+* Zip Code (categorical)
+* Geographic location (Latitude/Longitude)
+
+#### Account Information
+* Number of Referrals (numerical)
+* Tenure in Months (numerical)
+* Offer (categorical)
+* Contract (categorical - Month-to-Month, One Year, Two Year)
+* Paperless Billing (categorical - Yes/No)
+* Payment Method (categorical)
+
+#### Service Subscriptions
+* Phone Service (categorical - Yes/No)
+* Multiple Lines (categorical)
+* Internet Service (categorical - Yes/No)
+* Internet Type (categorical)
+* Avg Monthly GB Download (numerical)
+* Online Security (categorical - Yes/No)
+* Online Backup (categorical - Yes/No)
+* Device Protection Plan (categorical - Yes/No)
+* Premium Tech Support (categorical - Yes/No)
+* Streaming TV (categorical - Yes/No)
+* Streaming Movies (categorical - Yes/No)
+* Streaming Music (categorical - Yes/No)
+* Unlimited Data (categorical - Yes/No)
+
+#### Financial Metrics
+* Monthly Charge (numerical)
+* Total Charges (numerical)
+* Total Refunds (numerical)
+* Total Extra Data Charges (numerical)
+* Total Long Distance Charges (numerical)
+* Total Revenue (numerical)
+* Avg Monthly Long Distance Charges (numerical)
+
+#### Churn Details (for churned customers only)
+* Churn Category (categorical)
+* Churn Reason (categorical)
+
+## Preliminary Data Analysis
+
+```{r load-data, eval=TRUE}
+# Load the datasets
+telecom_churn <- read.csv("telecom_customer_churn.csv", stringsAsFactors = TRUE)
+zipcode_population <- read.csv("telecom_zipcode_population.csv")
+data_dictionary <- read.csv("telecom_data_dictionary.csv", encoding = "CP1252")
+
+# Clean column names
+telecom_churn <- clean_names(telecom_churn)
+zipcode_population <- clean_names(zipcode_population)
+data_dictionary <- clean_names(data_dictionary)
+
+# Display dataset structure 
+str(telecom_churn)
+
+# Create binary churn variable for analysis
+telecom_churn$churned <- ifelse(telecom_churn$customer_status == "Churned", "Yes", "No")
+telecom_churn$churned <- as.factor(telecom_churn$churned)
+
+# Basic summary statistics
+summary(telecom_churn[c("age", "tenure_in_months", "number_of_dependents", 
+                         "avg_monthly_gb_download", "monthly_charge", "total_charges")])
+```
+
+```{r eda-churn-visualization, fig.width=10, fig.height=6}
+# Calculate overall churn rate
+churn_rate <- mean(telecom_churn$customer_status == "Churned") * 100
+
+# Visualize the churn distribution
+ggplot(telecom_churn, aes(x = customer_status)) +
+  geom_bar(fill = c("darkgreen", "darkred", "steelblue")) +
+  geom_text(stat = "count", aes(label = scales::percent(..count../sum(after_stat(count)))), 
+            vjust = -0.5) +
+  labs(title = paste0("Customer Status Distribution (Churn Rate: ", round(churn_rate, 1), "%)"),
+       x = "Customer Status",
+       y = "Count") +
+  theme_minimal()
+```
+
+```{r categorical-analysis, fig.width=12, fig.height=8}
+# Analyze categorical variables by churn status
+cat_vars <- c("contract", "internet_type", "payment_method", "offer", "paperless_billing")
+
+# Create a function to plot churn rate by category
+plot_churn_by_category <- function(data, variable) {
+  # Calculate percentages
+  churn_by_cat <- data %>%
+    group_by(!!sym(variable)) %>%
+    summarize(
+      total = n(),
+      churned = sum(customer_status == "Churned"),
+      churn_rate = churned / total * 100
+    ) %>%
+    arrange(desc(churn_rate))
+  
+  # Create plot
+  ggplot(churn_by_cat, aes(x = reorder(!!sym(variable), -churn_rate), y = churn_rate)) +
+    geom_bar(stat = "identity", fill = "steelblue") +
+    geom_text(aes(label = paste0(round(churn_rate, 1), "%")), vjust = -0.5) +
+    labs(title = paste("Churn Rate by", variable),
+         x = variable,
+         y = "Churn Rate (%)") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+
+# Plot for contract type
+plot_churn_by_category(telecom_churn, "contract")
+```
+
+```{r numerical-analysis, fig.width=10, fig.height=6}
+# Analyze numerical variables by churn status
+num_vars <- c("age", "tenure_in_months", "monthly_charge", "total_charges", "avg_monthly_gb_download")
+
+# Create summary statistics by churn status
+num_summary <- telecom_churn %>%
+  group_by(churned) %>%
+  summarize(
+    avg_age = mean(age, na.rm = TRUE),
+    avg_tenure = mean(tenure_in_months, na.rm = TRUE),
+    avg_monthly_charge = mean(monthly_charge, na.rm = TRUE),
+    avg_total_charges = mean(total_charges, na.rm = TRUE),
+    avg_monthly_download = mean(avg_monthly_gb_download, na.rm = TRUE)
+  )
+
+print(num_summary)
+
+# Visualize tenure by churn status
+ggplot(telecom_churn, aes(x = churned, y = tenure_in_months, fill = churned)) +
+  geom_boxplot() +
+  labs(title = "Customer Tenure by Churn Status",
+       x = "Churned",
+       y = "Tenure (months)") +
+  scale_fill_manual(values = c("darkgreen", "darkred")) +
+  theme_minimal()
+```
+
+```{r service-adoption, fig.width=12, fig.height=8}
+# Analyze service adoption and its impact on churn
+service_vars <- c("phone_service", "multiple_lines", "online_security", 
+                  "online_backup", "device_protection_plan", "premium_tech_support",
+                  "streaming_tv", "streaming_movies", "streaming_music", "unlimited_data")
+
+# Specify which services to include in the visualization
+services_to_plot <- c("online_security", "premium_tech_support", "contract")
+
+# Create a function to calculate and visualize service impact on churn
+service_impact <- function(data, service_var) {
+  # Filter out NA values
+  data_filtered <- data %>% filter(!is.na(!!sym(service_var)))
+  
+  # Calculate churn rates
+  service_churn <- data_filtered %>%
+    group_by(!!sym(service_var)) %>%
+    summarize(
+      total = n(),
+      churned = sum(customer_status == "Churned"),
+      churn_rate = churned / total * 100
+    )
+  
+  return(service_churn)
+}
+
+# Example for one service
+online_security_impact <- service_impact(telecom_churn, "online_security")
+print(online_security_impact)
+
+# Create an empty data frame with the right structure
+services_plot_data <- data.frame(
+  service = character(),
+  service_value = character(),
+  total = numeric(),
+  churned = numeric(),
+  churn_rate = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Loop through each service
+for (service_name in services_to_plot) {
+  # Get the churn data for this service
+  service_data <- service_impact(telecom_churn, service_name)
+  
+  # Extract the service value column (which has a dynamic name)
+  service_values <- service_data[[1]]  # The first column contains the service values
+  
+  # Create a new data frame with consistent column names
+  temp_df <- data.frame(
+    service = service_name,
+    service_value = as.character(service_values),
+    total = service_data$total,
+    churned = service_data$churned,
+    churn_rate = service_data$churn_rate,
+    stringsAsFactors = FALSE
+  )
+  
+  # Add to the main data frame
+  services_plot_data <- rbind(services_plot_data, temp_df)
+}
+
+# Plot with the corrected data structure
+ggplot(services_plot_data, aes(x = reorder(paste(service, service_value), -churn_rate), y = churn_rate)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  geom_text(aes(label = paste0(round(churn_rate, 1), "%")), vjust = -0.5) +
+  labs(title = "Churn Rate by Selected Services",
+       x = "Service and Status",
+       y = "Churn Rate (%)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Relevant Summary Statistics
+
+Based on the preliminary analysis, the following summary statistics are relevant for understanding customer churn:
+
+* Overall churn rate: Approximately 26.5% of customers have churned
+* Demographic statistics:
+  * Age distribution shows typical consumer age range (18-80 years)
+  * Geographic distribution across multiple cities and zip codes
+* Service adoption statistics:
+  * Internet service types (Fiber Optic, DSL, None)
+  * Additional service adoption rates (security, backup, streaming, etc.)
+* Financial metrics:
+  * Average monthly charges for churned vs. retained customers
+  * Total charges and revenue differences between customer groups
+* Contract and tenure statistics:
+  * Contract type distribution shows higher churn for month-to-month contracts
+  * Average tenure for churned customers is significantly lower (approximately 18 months vs. 38 months for non-churned)
+
+## Statistical Methods
+
+### Primary Analysis Method: Logistic Regression
+
+Logistic regression is appropriate for this analysis because:
+
+* The response variable (churn) is binary (Yes/No)
+* We need to quantify the effect of multiple predictors on churn probability
+* We want to obtain interpretable odds ratios for business decision-making
+* It can handle both categorical and numerical predictors
+
+
+```{r logistic-regression-example, eval=TRUE}
+# Example of logistic regression model (simplified)
+churn_model <- glm(
+  churned ~ contract + internet_type + tenure_in_months + monthly_charge + 
+           online_security + premium_tech_support,
+  family = binomial(link = "logit"),
+  data = telecom_churn
+)
+
+# Model summary
+summary(churn_model)
+
+# Example prediction
+predicted_probs <- predict(churn_model, type = "response")
+telecom_churn$predicted_churn_prob <- predicted_probs
+
+# ROC curve assessment
+roc_obj <- roc(telecom_churn$churned, predicted_probs)
+auc_value <- auc(roc_obj)
+cat("AUC:", auc_value)
+```
+
+### Secondary Analysis Methods
+
+1. **Random Forest Classification**
+   * Will help identify complex non-linear relationships and interactions
+   * Provides feature importance to highlight the most predictive variables
+   * Handles mixed data types effectively
+
+```{r random-forest-example, eval=FALSE}
+# Random Forest example (not evaluated to save computation time)
+set.seed(123)
+rf_model <- randomForest(
+  churned ~ contract + internet_type + tenure_in_months + monthly_charge + 
+            online_security + premium_tech_support + payment_method + age,
+  data = telecom_churn,
+  ntree = 100,
+  importance = TRUE
+)
+
+# Variable importance
+varImpPlot(rf_model)
+```
+
+2. **Survival Analysis**
+   * Can analyze time-to-churn based on tenure
+   * Provides insights into when customers are most at risk of churning
+   * Allows for censored observations (current customers who haven't churned yet)
+
+### Model Evaluation Strategy
+
+The models will be evaluated using:
+
+* Train/test split (70%/30%) for model validation
+* Cross-validation to ensure model robustness
+* ROC curves and AUC for classification performance
+* Confusion matrix for precision, recall, and F1-score
+* McFadden's R² for logistic regression fit assessment
+
+## Expected Outcomes
+
+This analysis is expected to:
+
+1. Identify the key predictors of customer churn in the telecom industry
+2. Quantify the impact of each factor on churn probability
+3. Develop a predictive model to identify at-risk customers before they churn
+4. Provide actionable insights for reducing churn through targeted interventions
+5. Generate recommendations for service improvements and retention strategies
+
+The results will be valuable for:
+
+* Marketing teams designing retention campaigns
+* Product managers prioritizing service improvements
+* Customer service teams implementing proactive retention measures
+* Business leaders making strategic decisions about service offerings
